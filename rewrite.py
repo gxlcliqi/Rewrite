@@ -4,6 +4,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import time
 import os
 import shutil
 import argparse
@@ -177,108 +178,117 @@ def main(_):
     with tf.name_scope("convert_bitmaps"):
         convert_bitmap = tf.reshape(y_hat_image, shape=[-1, 80, 80])
 
-    tf.scalar_summary('pixel_abs_loss', pixel_abs_loss)
-    tf.scalar_summary('combined_loss', combined_loss)
-    tf.scalar_summary('tv_loss', tv_loss)
-    merged = tf.merge_all_summaries()
+    tf.summary.scalar('pixel_abs_loss', pixel_abs_loss)
+    tf.summary.scalar('combined_loss', combined_loss)
+    tf.summary.scalar('tv_loss', tv_loss)
+    merged = tf.summary.merge_all()
 
-    sess = tf.InteractiveSession()
-    if FLAGS.mode == 'train':
-        # in case train
-        source_font = FLAGS.source_font
-        target_font = FLAGS.target_font
-        num_examples = FLAGS.num_examples
-        num_validation = FLAGS.num_validations
-        split = num_examples - num_validation
-        train_keep_prob = FLAGS.keep_prob
-        num_iter = FLAGS.iter
-        frame_dir = FLAGS.frame_dir
-        checkpoint_steps = FLAGS.ckpt_steps
-        num_checkpoints = FLAGS.num_ckpt
-        checkpoints_dir = FLAGS.ckpt_dir
+    config = tf.ConfigProto(device_count={"CPU": 2},  # limit to num_cpu_core CPU usage
+                            inter_op_parallelism_threads = 1,
+                            intra_op_parallelism_threads = 2,
+                            log_device_placement = True)
 
-        dataset = FontDataManager(source_font, target_font, num_examples, split)
-        saver = tf.train.Saver(max_to_keep=num_checkpoints)
+    with tf.Session(config=config) as sess:
+        if FLAGS.mode == 'train':
+            # in case train
+            source_font = FLAGS.source_font
+            target_font = FLAGS.target_font
+            num_examples = FLAGS.num_examples
+            num_validation = FLAGS.num_validations
+            split = num_examples - num_validation
+            train_keep_prob = FLAGS.keep_prob
+            num_iter = FLAGS.iter
+            frame_dir = FLAGS.frame_dir
+            checkpoint_steps = FLAGS.ckpt_steps
+            num_checkpoints = FLAGS.num_ckpt
+            checkpoints_dir = FLAGS.ckpt_dir
 
-        train_writer = tf.train.SummaryWriter(os.path.join(FLAGS.summary_dir, 'train'),
-                                              sess.graph)
-        validation_writer = tf.train.SummaryWriter(os.path.join(FLAGS.summary_dir, 'validation'))
-        sess.run(tf.initialize_all_variables())
-        if FLAGS.capture_frame:
-            print("frame capture enabled. frames saved at %s" % frame_dir)
-        if FLAGS.alpha > 0:
-            print("leaky relu is used. alpha %.2f" % FLAGS.alpha)
-        for i in range(num_iter):
-            steps = i + 1
-            batch_x, batch_y = dataset.next_train_batch(batch_size)
-            if steps % 10 == 0:
-                validation_x, validation_y = dataset.get_validation()
-                summary, validation_loss, bitmaps = sess.run([merged, combined_loss, convert_bitmap],
-                                                             feed_dict={x: validation_x,
-                                                                        y: validation_y,
-                                                                        phase_train: False,
-                                                                        keep_prob: 1.0})
-                train_summary, train_loss = sess.run([merged, combined_loss], feed_dict={
+            dataset = FontDataManager(source_font, target_font, num_examples, split)
+            saver = tf.train.Saver(max_to_keep=num_checkpoints)
+
+            train_writer = tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'),
+                                                  sess.graph)
+            validation_writer = tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'validation'))
+            sess.run(tf.global_variables_initializer())
+            if FLAGS.capture_frame:
+                print("frame capture enabled. frames saved at %s" % frame_dir)
+            if FLAGS.alpha > 0:
+                print("leaky relu is used. alpha %.2f" % FLAGS.alpha)
+            start_time = time.time()
+            for i in range(num_iter):
+                steps = i + 1
+                print("steps="+str(steps))
+                batch_x, batch_y = dataset.next_train_batch(batch_size)
+                elapsed_time = time.time() - start_time
+                start_time = time.time()
+                if steps % 10 == 0:
+                    validation_x, validation_y = dataset.get_validation()
+                    summary, validation_loss, bitmaps = sess.run([merged, combined_loss, convert_bitmap],
+                                                                 feed_dict={x: validation_x,
+                                                                            y: validation_y,
+                                                                            phase_train: False,
+                                                                            keep_prob: 1.0})
+                    train_summary, train_loss = sess.run([merged, combined_loss], feed_dict={
+                        x: batch_x,
+                        y: batch_y,
+                        phase_train: False,
+                        keep_prob: 1.0}, )
+                    if FLAGS.capture_frame:
+                        render_frame(bitmaps, frame_dir, steps)
+                    validation_writer.add_summary(summary, steps)
+                    train_writer.add_summary(train_summary, steps)
+                    print("step %d, validation loss %g, training loss %g, secs/step: %f" % (steps, validation_loss, train_loss, elapsed_time))
+                if steps % checkpoint_steps == 0:
+                    # do checkpointing
+                    ckpt_path = os.path.join(checkpoints_dir, "model.ckpt")
+                    print("checkpoint at step %d" % steps)
+                    saver.save(sess, ckpt_path, global_step=steps)
+                train_step.run(feed_dict={x: batch_x,
+                                          y: batch_y,
+                                          phase_train: True,
+                                          learning_rate: FLAGS.lr,
+                                          keep_prob: train_keep_prob})
+            if FLAGS.capture_frame:
+                print("compile frames in %s to gif" % FLAGS.frame_dir)
+                gif = compile_frames_to_gif(frame_dir, os.path.join(frame_dir, default_gif_name))
+                print("gif saved at %s" % gif)
+        elif FLAGS.mode == 'infer':
+            infer_batch_size = 64
+            saver = tf.train.Saver()
+            print("checkpoint located %s" % FLAGS.ckpt)
+            saver.restore(sess, FLAGS.ckpt)
+            font_bitmaps = read_font_data(FLAGS.source_font, True)
+            print("found %d source fonts" % font_bitmaps.shape[0])
+            total_batches = int(np.ceil(font_bitmaps.shape[0] / infer_batch_size))
+            print("batch size %d. %d batches in total" % (infer_batch_size,
+                                                          total_batches))
+            target = list()
+            batch_count = 0
+            for i in range(0, font_bitmaps.shape[0], infer_batch_size):
+                i2 = i + infer_batch_size
+                batch_x = font_bitmaps[i: i2]
+                batch_count += 1
+                if batch_count % 10 == 0:
+                    print("%d batches has completed" % batch_count)
+                target_bitmaps, = sess.run([convert_bitmap], feed_dict={
                     x: batch_x,
-                    y: batch_y,
                     phase_train: False,
-                    keep_prob: 1.0}, )
-                if FLAGS.capture_frame:
-                    render_frame(bitmaps, frame_dir, steps)
-                validation_writer.add_summary(summary, steps)
-                train_writer.add_summary(train_summary, steps)
-                print("step %d, validation loss %g, training loss %g" % (steps, validation_loss, train_loss))
-            if steps % checkpoint_steps == 0:
-                # do checkpointing
-                ckpt_path = os.path.join(checkpoints_dir, "model.ckpt")
-                print("checkpoint at step %d" % steps)
-                saver.save(sess, ckpt_path, global_step=steps)
-            train_step.run(feed_dict={x: batch_x,
-                                      y: batch_y,
-                                      phase_train: True,
-                                      learning_rate: FLAGS.lr,
-                                      keep_prob: train_keep_prob})
-        if FLAGS.capture_frame:
-            print("compile frames in %s to gif" % FLAGS.frame_dir)
-            gif = compile_frames_to_gif(frame_dir, os.path.join(frame_dir, default_gif_name))
-            print("gif saved at %s" % gif)
-    elif FLAGS.mode == 'infer':
-        infer_batch_size = 64
-        saver = tf.train.Saver()
-        print("checkpoint located %s" % FLAGS.ckpt)
-        saver.restore(sess, FLAGS.ckpt)
-        font_bitmaps = read_font_data(FLAGS.source_font, True)
-        print("found %d source fonts" % font_bitmaps.shape[0])
-        total_batches = int(np.ceil(font_bitmaps.shape[0] / infer_batch_size))
-        print("batch size %d. %d batches in total" % (infer_batch_size,
-                                                      total_batches))
-        target = list()
-        batch_count = 0
-        for i in range(0, font_bitmaps.shape[0], infer_batch_size):
-            i2 = i + infer_batch_size
-            batch_x = font_bitmaps[i: i2]
-            batch_count += 1
-            if batch_count % 10 == 0:
-                print("%d batches has completed" % batch_count)
-            target_bitmaps, = sess.run([convert_bitmap], feed_dict={
-                x: batch_x,
-                phase_train: False,
-                keep_prob: 1.0
-            })
-            target_bitmaps = (target_bitmaps * 255.).astype(dtype=np.int16) % 256
-            for tb in target_bitmaps:
-                target.append(tb)
-        target = np.asarray(target)
-        target_path = os.path.join(FLAGS.bitmap_dir, "target.bitmap.npy")
-        print("inferred bitmap save at %s" % target_path)
-        render_batch = 100
-        for i in range(0, target.shape[0], render_batch):
-            render_fonts_image(target[i: i + render_batch],
-                               os.path.join(FLAGS.bitmap_dir, "fonts_%04d_to_%04d.png" % (i, i + render_batch)), 10,
-                               False)
-        np.save(target_path, target)
-    else:
-        raise Exception("unknown mode %s" % FLAGS.mode)
+                    keep_prob: 1.0
+                })
+                target_bitmaps = (target_bitmaps * 255.).astype(dtype=np.int16) % 256
+                for tb in target_bitmaps:
+                    target.append(tb)
+            target = np.asarray(target)
+            target_path = os.path.join(FLAGS.bitmap_dir, "target.bitmap.npy")
+            print("inferred bitmap save at %s" % target_path)
+            render_batch = 100
+            for i in range(0, target.shape[0], render_batch):
+                render_fonts_image(target[i: i + render_batch],
+                                   os.path.join(FLAGS.bitmap_dir, "fonts_%04d_to_%04d.png" % (i, i + render_batch)), 10,
+                                   False)
+            np.save(target_path, target)
+        else:
+            raise Exception("unknown mode %s" % FLAGS.mode)
 
 
 if __name__ == '__main__':

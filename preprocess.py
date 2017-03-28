@@ -6,6 +6,7 @@ from __future__ import print_function
 
 import argparse
 import sys
+import importlib
 import numpy as np
 import os
 from PIL import Image
@@ -13,11 +14,10 @@ from PIL import ImageDraw
 from PIL import ImageFont
 from utils import render_fonts_image
 
-reload(sys)
-sys.setdefaultencoding("utf-8")
+importlib.reload(sys)
+#sys.setdefaultencoding("utf-8")
 
 FLAGS = None
-
 
 def draw_char_bitmap(ch, font, char_size, x_offset, y_offset):
     image = Image.new("RGB", (char_size, char_size), (255, 255, 255))
@@ -62,7 +62,7 @@ def get_chars_set(path):
     Expect a text file that each line is a char
     """
     chars = list()
-    with open(path) as f:
+    with open(path, encoding='utf8') as f:
         for line in f:
             line = u"%s" % line
             char = line.split()[0]
